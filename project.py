@@ -484,7 +484,7 @@ if __name__ == "__main__":
 🏷️ Klasifikasi: <b>{predicted_class.upper()}</b>
 📊 Confidence: {confidence:.2%}
 
-{self.get_recommendation(predicted_class)}"""
+{rice_system.get_recommendation(predicted_class)}"""
                         rice_system.send_telegram_notification(message, image_path)
                     else:
                         print("❌ Chat ID tidak ditemukan. Kirim '/start' ke bot terlebih dahulu.")
