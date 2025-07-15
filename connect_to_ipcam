@@ -1,0 +1,512 @@
+import cv2
+import numpy as np
+import threading
+import time
+import requests
+from datetime import datetime
+
+class AndroidIPWebcam:
+    def __init__(self, ip_address, port=8080, username=None, password=None):
+        """
+        Initialize Android IP Webcam stream
+        
+        Args:
+            ip_address (str): IP address HP Android (contoh: "192.168.1.3")
+            port (int): Port aplikasi IP Webcam (default: 8080)
+            username (str): Username jika diset di aplikasi
+            password (str): Password jika diset di aplikasi
+        """
+        self.ip_address = ip_address
+        self.port = port
+        self.username = username
+        self.password = password
+        self.cap = None
+        self.frame = None
+        self.running = False
+        self.thread = None
+        self.frame_count = 0
+        
+        # URL endpoints untuk IP Webcam app
+        self.base_url = f"http://{ip_address}:{port}"
+        self.video_url = f"{self.base_url}/video"
+        self.mjpeg_url = f"{self.base_url}/videofeed" 
+        self.snapshot_url = f"{self.base_url}/shot.jpg"
+        
+        # Setup authentication jika ada
+        self.auth = None
+        if username and password:
+            self.auth = (username, password)
+    
+    def test_endpoints(self):
+        """Test semua endpoint yang mungkin untuk IP Webcam app"""
+        print(f"Testing Android IP Webcam endpoints for {self.ip_address}:{self.port}")
+        
+        # Endpoint umum untuk IP Webcam app
+        endpoints = [
+            "/video",           # Video stream utama
+            "/videofeed",       # MJPEG feed
+            "/shot.jpg",        # Single snapshot
+            "/",                # Web interface
+            "/cam/1/stream",    # Alternative stream
+            "/mjpeg",           # MJPEG alternative
+        ]
+        
+        working_endpoints = []
+        
+        for endpoint in endpoints:
+            test_url = f"{self.base_url}{endpoint}"
+            try:
+                print(f"Testing: {test_url}")
+                
+                # Test dengan timeout pendek
+                response = requests.get(test_url, timeout=5, auth=self.auth, stream=True)
+                
+                if response.status_code == 200:
+                    content_type = response.headers.get('content-type', '').lower()
+                    content_length = response.headers.get('content-length', 'unknown')
+                    
+                    print(f"  ✓ Status: {response.status_code}")
+                    print(f"  ✓ Content-Type: {content_type}")
+                    print(f"  ✓ Content-Length: {content_length}")
+                    
+                    # Deteksi content type yang cocok untuk streaming
+                    is_suitable = any([
+                        'video' in content_type,
+                        'mjpeg' in content_type,
+                        'multipart/x-mixed-replace' in content_type,  # Format MJPEG standar
+                        'application/octet-stream' in content_type
+                    ])
+                    
+                    working_endpoints.append({
+                        'url': test_url,
+                        'content_type': content_type,
+                        'suitable_for_stream': is_suitable
+                    })
+                else:
+                    print(f"  ✗ Status: {response.status_code}")
+                    
+            except requests.exceptions.Timeout:
+                print(f"  ✗ Timeout")
+            except requests.exceptions.ConnectionError:
+                print(f"  ✗ Connection refused")
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+        
+        return working_endpoints
+    
+    def get_camera_info(self):
+        """Dapatkan informasi dari IP Webcam app"""
+        try:
+            # IP Webcam app biasanya punya endpoint status
+            status_url = f"{self.base_url}/status.json"
+            response = requests.get(status_url, auth=self.auth, timeout=5)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"Tidak bisa mendapatkan info camera: {e}")
+            return None
+    
+    def start_stream(self, preferred_endpoint="/video"):
+        """Mulai streaming dari Android IP Webcam"""
+        
+        # Test endpoints dulu
+        print("=== Testing Android IP Webcam Endpoints ===")
+        working_endpoints = self.test_endpoints()
+        
+        if not working_endpoints:
+            print("✗ Tidak ada endpoint yang berfungsi!")
+            print("\nTroubleshooting:")
+            print("1. Pastikan aplikasi IP Webcam berjalan di HP")
+            print("2. Cek IP address HP di aplikasi")
+            print("3. Pastikan HP dan PC di network yang sama")
+            print("4. Coba akses via browser: http://{self.ip_address}:{self.port}")
+            return False
+        
+        print(f"\n✓ Ditemukan {len(working_endpoints)} endpoint yang berfungsi")
+        
+        # Pilih endpoint terbaik untuk streaming
+        stream_endpoints = [ep for ep in working_endpoints if ep['suitable_for_stream']]
+        
+        if not stream_endpoints:
+            print("✗ Tidak ada endpoint yang cocok untuk streaming")
+            print("Debug: Working endpoints:")
+            for ep in working_endpoints:
+                print(f"  - {ep['url']} ({ep['content_type']}) - Suitable: {ep['suitable_for_stream']}")
+            return False
+        
+        print(f"✓ Ditemukan {len(stream_endpoints)} endpoint streaming:")
+        for ep in stream_endpoints:
+            print(f"  - {ep['url']} ({ep['content_type']})")
+        
+        # Coba setiap endpoint untuk streaming
+        for endpoint_info in stream_endpoints:
+            stream_url = endpoint_info['url']
+            print(f"\nMencoba streaming dari: {stream_url}")
+            
+            if self._try_opencv_stream(stream_url):
+                return True
+        
+        # Jika OpenCV gagal, coba metode alternatif
+        print("\nOpenCV streaming gagal, mencoba metode MJPEG manual...")
+        
+        # Coba endpoint videofeed dengan parser MJPEG manual
+        for endpoint_info in stream_endpoints:
+            if 'videofeed' in endpoint_info['url'] or 'video' in endpoint_info['url']:
+                if self._try_mjpeg_stream(endpoint_info['url']):
+                    return True
+        
+        return False
+    
+    def _try_opencv_stream(self, stream_url):
+        """Coba streaming dengan OpenCV"""
+        try:
+            # Format URL dengan auth jika perlu
+            if self.auth:
+                from urllib.parse import urlparse
+                parsed = urlparse(stream_url)
+                auth_url = f"{parsed.scheme}://{self.auth[0]}:{self.auth[1]}@{parsed.netloc}{parsed.path}"
+                stream_url = auth_url
+            
+            print(f"  Mencoba OpenCV dengan URL: {stream_url}")
+            
+            # Coba berbagai backend OpenCV
+            backends = [
+                (cv2.CAP_FFMPEG, "FFMPEG"),
+                (cv2.CAP_ANY, "ANY"),
+                (cv2.CAP_GSTREAMER, "GSTREAMER") if hasattr(cv2, 'CAP_GSTREAMER') else None
+            ]
+            backends = [b for b in backends if b is not None]
+            
+            for backend_id, backend_name in backends:
+                print(f"    Trying backend: {backend_name}")
+                
+                self.cap = cv2.VideoCapture(stream_url, backend_id)
+                
+                # Set properties untuk Android IP Webcam
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)
+                self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000)
+                
+                if self.cap.isOpened():
+                    print(f"    ✓ Stream opened with {backend_name}")
+                    
+                    # Test baca frame beberapa kali
+                    success_count = 0
+                    for i in range(10):
+                        ret, frame = self.cap.read()
+                        if ret and frame is not None:
+                            success_count += 1
+                            if success_count >= 2:  # Minimal 2 frame berhasil
+                                print(f"    ✓ Successfully read {success_count} frames: {frame.shape}")
+                                
+                                # Mulai thread untuk update frame
+                                self.running = True
+                                self.thread = threading.Thread(target=self._update_frames)
+                                self.thread.daemon = True
+                                self.thread.start()
+                                
+                                return True
+                        else:
+                            print(f"    Frame {i+1}: Failed")
+                        time.sleep(0.2)
+                    
+                    print(f"    ✗ Only got {success_count} successful frames")
+                
+                self.cap.release()
+                self.cap = None
+            
+            return False
+            
+        except Exception as e:
+            print(f"    ✗ OpenCV Exception: {e}")
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            return False
+    
+    def _try_mjpeg_stream(self, mjpeg_url=None):
+        """Metode alternatif untuk MJPEG stream"""
+        try:
+            if mjpeg_url is None:
+                mjpeg_url = f"{self.base_url}/videofeed"
+            
+            print(f"Mencoba MJPEG stream: {mjpeg_url}")
+            
+            # Gunakan requests untuk MJPEG
+            self.mjpeg_response = requests.get(mjpeg_url, auth=self.auth, stream=True, timeout=15)
+            
+            if self.mjpeg_response.status_code == 200:
+                print("✓ MJPEG stream response OK")
+                
+                # Test apakah bisa parse MJPEG
+                if self._test_mjpeg_parsing():
+                    self.running = True
+                    self.thread = threading.Thread(target=self._update_mjpeg_frames)
+                    self.thread.daemon = True
+                    self.thread.start()
+                    return True
+                else:
+                    print("✗ MJPEG parsing failed")
+                    return False
+            else:
+                print(f"✗ MJPEG failed: {self.mjpeg_response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"✗ MJPEG error: {e}")
+            return False
+    
+    def _test_mjpeg_parsing(self):
+        """Test parsing MJPEG stream"""
+        try:
+            print("Testing MJPEG parsing...")
+            bytes_buffer = b''
+            
+            # Baca chunk pertama untuk test
+            for i, chunk in enumerate(self.mjpeg_response.iter_content(chunk_size=8192)):
+                bytes_buffer += chunk
+                
+                # Cari JPEG boundaries
+                start_marker = bytes_buffer.find(b'\xff\xd8')
+                end_marker = bytes_buffer.find(b'\xff\xd9')
+                
+                if start_marker != -1 and end_marker != -1 and end_marker > start_marker:
+                    # Found complete JPEG
+                    jpeg_data = bytes_buffer[start_marker:end_marker+2]
+                    
+                    # Try to decode
+                    np_arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                    
+                    if frame is not None:
+                        print(f"✓ MJPEG parsing successful: {frame.shape}")
+                        return True
+                
+                # Jangan test terlalu lama
+                if i > 50:  # Maximum 50 chunks untuk test
+                    break
+            
+            print("✗ MJPEG parsing failed - no valid frames found")
+            return False
+            
+        except Exception as e:
+            print(f"✗ MJPEG parsing test error: {e}")
+            return False
+    
+    def _update_frames(self):
+        """Update frames untuk OpenCV stream"""
+        while self.running:
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    self.frame = frame
+                    self.frame_count += 1
+                else:
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"Frame update error: {e}")
+                time.sleep(0.1)
+    
+    def _update_mjpeg_frames(self):
+        """Update frames untuk MJPEG stream dengan parsing yang lebih robust"""
+        bytes_buffer = b''
+        
+        print("Starting MJPEG frame reader...")
+        
+        while self.running:
+            try:
+                for chunk in self.mjpeg_response.iter_content(chunk_size=8192):
+                    if not self.running:
+                        break
+                    
+                    bytes_buffer += chunk
+                    
+                    # Cari JPEG start dan end markers
+                    while True:
+                        start_marker = bytes_buffer.find(b'\xff\xd8')
+                        if start_marker == -1:
+                            break
+                        
+                        # Cari end marker setelah start
+                        end_marker = bytes_buffer.find(b'\xff\xd9', start_marker)
+                        if end_marker == -1:
+                            break
+                        
+                        # Extract JPEG data
+                        jpeg_data = bytes_buffer[start_marker:end_marker+2]
+                        bytes_buffer = bytes_buffer[end_marker+2:]
+                        
+                        try:
+                            # Decode JPEG ke OpenCV frame
+                            np_arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+                            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                            
+                            if frame is not None:
+                                self.frame = frame
+                                self.frame_count += 1
+                                
+                                # Debug setiap 100 frame
+                                if self.frame_count % 100 == 0:
+                                    print(f"MJPEG frames processed: {self.frame_count}")
+                            
+                        except Exception as decode_error:
+                            print(f"JPEG decode error: {decode_error}")
+                            continue
+                        
+                        break  # Process next chunk
+                    
+                    # Limit buffer size
+                    if len(bytes_buffer) > 1024*1024:  # 1MB max
+                        bytes_buffer = bytes_buffer[-512*1024:]  # Keep last 512KB
+                        
+            except Exception as e:
+                print(f"MJPEG stream error: {e}")
+                time.sleep(1)
+                # Try to reconnect
+                try:
+                    self.mjpeg_response.close()
+                    self.mjpeg_response = requests.get(f"{self.base_url}/videofeed", 
+                                                     auth=self.auth, stream=True, timeout=10)
+                except:
+                    pass
+    
+    def get_frame(self):
+        """Dapatkan frame terbaru"""
+        return self.frame
+    
+    def take_snapshot(self):
+        """Ambil snapshot langsung dari HP"""
+        try:
+            response = requests.get(self.snapshot_url, auth=self.auth, timeout=5)
+            if response.status_code == 200:
+                # Save snapshot
+                filename = f"snapshot_{int(time.time())}.jpg"
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                print(f"Snapshot disimpan: {filename}")
+                return filename
+            else:
+                print(f"Snapshot gagal: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"Snapshot error: {e}")
+            return None
+    
+    def stop(self):
+        """Stop streaming"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        if self.cap:
+            self.cap.release()
+        print("Stream stopped")
+
+def main():
+    """Main function untuk Android IP Webcam"""
+    
+    print("=== Android IP Webcam Stream ===")
+    print("Aplikasi: IP Webcam (Thyoni Tech)")
+    
+    # Konfigurasi - GANTI DENGAN IP HP ANDA
+    phone_ip = "192.168.1.3"  # Ganti dengan IP HP Android Anda
+    phone_port = 8080         # Port default IP Webcam app
+    
+    # Jika menggunakan password di aplikasi, uncomment baris berikut:
+    # username = "admin"
+    # password = "your_password"
+    # webcam = AndroidIPWebcam(phone_ip, phone_port, username, password)
+    
+    webcam = AndroidIPWebcam(phone_ip, phone_port)
+    
+    print(f"Connecting to Android IP Webcam: {phone_ip}:{phone_port}")
+    
+    # Dapatkan info camera jika ada
+    camera_info = webcam.get_camera_info()
+    if camera_info:
+        print("Camera Info:", camera_info)
+    
+    try:
+        if webcam.start_stream():
+            print("\n✓ Stream berhasil dimulai!")
+            print("Controls:")
+            print("  'q' - Quit")
+            print("  's' - Screenshot dari stream")
+            print("  'p' - Snapshot langsung dari HP")
+            print("  'f' - Toggle fullscreen")
+            
+            # Tunggu stream stabil
+            time.sleep(2)
+            
+            fullscreen = False
+            
+            while True:
+                frame = webcam.get_frame()
+                
+                if frame is not None:
+                    # Tambahkan overlay info
+                    display_frame = frame.copy()
+                    
+                    # Info overlay
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    info_text = f"Frame: {webcam.frame_count} | {timestamp}"
+                    
+                    cv2.putText(display_frame, info_text, (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(display_frame, f"IP: {phone_ip}:{phone_port}", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    
+                    # Tampilkan frame
+                    window_name = 'Android IP Webcam Stream'
+                    if fullscreen:
+                        cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
+                        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    else:
+                        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    
+                    cv2.imshow(window_name, display_frame)
+                    
+                    # Handle keyboard input
+                    key = cv2.waitKey(1) & 0xFF
+                    
+                    if key == ord('q'):
+                        break
+                    elif key == ord('s'):
+                        # Screenshot dari stream
+                        filename = f"stream_capture_{int(time.time())}.jpg"
+                        cv2.imwrite(filename, frame)
+                        print(f"Screenshot disimpan: {filename}")
+                    elif key == ord('p'):
+                        # Snapshot langsung dari HP
+                        webcam.take_snapshot()
+                    elif key == ord('f'):
+                        # Toggle fullscreen
+                        fullscreen = not fullscreen
+                        cv2.destroyAllWindows()
+                
+                else:
+                    # No frame available
+                    print("Waiting for frames from Android IP Webcam...")
+                    time.sleep(0.1)
+        
+        else:
+            print("✗ Gagal memulai stream")
+            print("\nTroubleshooting:")
+            print("1. Pastikan aplikasi 'IP Webcam' berjalan di HP Android")
+            print("2. Cek IP address di aplikasi (Settings > IP Address)")
+            print("3. Pastikan HP dan PC terhubung ke WiFi yang sama")
+            print(f"4. Coba buka http://{phone_ip}:{phone_port} di browser")
+            print("5. Cek firewall/antivirus yang mungkin memblokir koneksi")
+    
+    except KeyboardInterrupt:
+        print("\nProgram dihentikan oleh user")
+    
+    finally:
+        webcam.stop()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
